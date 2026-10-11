@@ -238,10 +238,24 @@ function callable_fields(ir::MechanismIR, block::IRBlock)
         input == TemperatureInput && push!(context, :celsius)
     end
     effects.random && append!(context, (:rng_counters, :rng_keys, :rng_words, :seed))
-    effects.schedules_events && append!(context, (:targets, :outbox, :errors, :weights, :t, :edge))
+    if ir.role == :micro &&
+       :dt in effects.reads &&
+       any(block -> contains_euler(block.body), values(ir.blocks))
+        push!(context, :secondorder)
+    end
+    effects.schedules_events && append!(context, (:targets, :outbox, :errors, :t, :edge))
     effects.emits_spikes && append!(
         context,
-        (:targets, :target_offsets, :target_sources, :spikes, :macro_spikes, :errors),
+        (
+            :targets,
+            :target_offsets,
+            :target_sources,
+            :spikes,
+            :macro_spikes,
+            :outbox,
+            :errors,
+            :edge,
+        ),
     )
     unique!(context)
     return (; names, aliases, updates, context)
@@ -355,10 +369,12 @@ function generated_phase(ir::MechanismIR, phase::Symbol, calls)
         phase == :event_initialize ?
         ModStatement[statement for statement in block.body if statement isa EventInitialStatement] :
         block.body
-    if phase == :advance &&
-       ir.role == :micro &&
-       (has_membrane_current(ir) || contains_solve(statements))
-        statements = state_update_statements(statements)
+    if phase == :advance && ir.role == :micro
+        equations = state_update_statements(statements)
+        # Native nrn_state executes hoisted SOLVEs first. A mechanism without
+        # membrane currents then executes the rest of BREAKPOINT as well.
+        statements =
+            has_membrane_current(ir) ? equations : [equations; breakpoint_remainder(statements)]
     end
     temporary =
         block === nothing ? Set{Symbol}() : union(Set(block.arguments), local_symbols(block.body))
@@ -372,6 +388,17 @@ function generated_phase(ir::MechanismIR, phase::Symbol, calls)
     variables = Dict{Symbol, Any}()
     derivatives = Dict{Symbol, Any}()
     body = Any[Expr(:meta, :inline)]
+    if phase == :advance &&
+       ir.role == :micro &&
+       block !== nothing &&
+       contains_solve(block.body) &&
+       any(block -> contains_euler(block.body), values(ir.blocks))
+        push!(body, :(
+            if _context.secondorder != 0
+                _context = context_at(_context; dt = 0.5 * _context.dt)
+            end
+        ))
+    end
     voltage_copy = has_event_initializer(ir) && phase in (:initialize, :event_initialize)
     phase == :receive && push!(body, :(receive_ions!(_data, _instance, _context, Val(false))))
     for field in ir.fields
@@ -646,20 +673,26 @@ function emit_solve(solve::SolveStatement, context::CodegenContext)
     append!(body, julia_statements(block.body, nested))
     if solve.method == :euler
         # Native Euler evaluates all rates before integrating their targets.
-        # Ordinary assignments to other STATE variables are already complete.
+        # Keep the two rounded additions used by secondorder, with half-step
+        # dt visible throughout nrn_state (including the remaining BREAKPOINT).
+        updates = Any[]
         for name in states
             state, rate = nested.variables[name], nested.derivatives[name]
             dt = nested.variables[:dt]
             extent = fieldinfo(context.ir, name).extent
             if extent == 0
-                push!(body, :($state = $state + $dt * $rate))
+                push!(updates, :($state = $state + $dt * $rate))
             else
-                push!(body, :(
+                push!(updates, :(
                     for index in 1:($extent)
                         $state[index] = $state[index] + $dt * $rate[index]
                     end
                 ))
             end
+        end
+        append!(body, updates)
+        if context.ir.role == :micro
+            push!(body, Expr(:if, :(_context.secondorder != 0), Expr(:block, updates...)))
         end
     end
     return body

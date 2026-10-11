@@ -435,3 +435,39 @@ function unit_constant_expression(expression, definitions)
         :fabs,
     ) && all(argument -> unit_constant_expression(argument, definitions), expression.arguments)
 end
+# Keep BREAKPOINT's remaining control flow after SOLVE has moved to nrn_state.
+function breakpoint_remainder(body::Vector{ModStatement})
+    statements = ModStatement[]
+    for statement in body
+        statement isa SolveStatement && continue
+        if statement isa Conditional
+            statement = Conditional(
+                statement.condition,
+                breakpoint_remainder(statement.consequent),
+                breakpoint_remainder(statement.alternative),
+                statement.location,
+            )
+        elseif statement isa WhileStatement
+            statement = WhileStatement(
+                statement.condition,
+                breakpoint_remainder(statement.body),
+                statement.location,
+            )
+        end
+        push!(statements, statement)
+    end
+    return statements
+end
+
+function contains_euler(body::Vector{ModStatement})
+    for statement in body
+        statement isa SolveStatement && statement.method == :euler && return true
+        if statement isa Conditional
+            (contains_euler(statement.consequent) || contains_euler(statement.alternative)) &&
+                return true
+        elseif statement isa WhileStatement || statement isa EventInitialStatement
+            contains_euler(statement.body) && return true
+        end
+    end
+    return false
+end

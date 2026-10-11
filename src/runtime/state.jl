@@ -39,22 +39,20 @@ Adapt.@adapt_structure EventOutbox
 
 """CPU event ordering and reusable transfers; MOD state stays in its owning mechanism storage."""
 mutable struct EventSchedule{D, L, I}
-    heaps::Vector{Vector{ScheduledEvent}}
-    external::Vector{ScheduledEvent}
+    heap::Vector{ScheduledEvent}
     target_groups::Vector{Int32}
     target_rows::Vector{Int32}
-    target_levels::Vector{Int}
+    target_ranks::Vector{Int}
+    source_ranks::Vector{Int}
     target_source_offsets::Vector{Int64}
     target_sources::Vector{Int32}
     feedback::BitVector
     ordered::Bool
-    pattern_cursor::Int
+    next_order::Int64
     count::Vector{Int64}
     requests::Vector{ScheduledEvent}
     collected::D
     pending::Vector{ScheduledEvent}
-    postponed::Vector{ScheduledEvent}
-    marked::BitVector
     events::D
     staging::Vector{ScheduledEvent}
     offsets::Vector{Int64}
@@ -71,10 +69,6 @@ struct RuntimeConfiguration
     dt_macro::Float64
     celsius::Float64
     secondorder::Int
-end
-
-struct CableWorkspace{V}
-    previous_voltage::V
 end
 
 struct SpikeBuffer{F, C, P}
@@ -197,8 +191,6 @@ mutable struct SimulationState{V, I, L, B, M, H, Q, S, W} <: AbstractSimulationS
     parent::I
     diagonal::V
     rhs::V
-    current::V
-    conductance::V
     ions::M
     outbox::Q
     spikes::S
@@ -250,6 +242,7 @@ struct DeviceContext{V, I, U, Q, S, W, O, E, R, B, G, P, X, T, J}
     serial::P
     t::Float64
     dt::Float64
+    secondorder::Int
     celsius::Float64
     v_init::Float64
     start_time::Float64
@@ -278,6 +271,7 @@ struct NumericalContext{V, I, G, P, X, J}
     serial::P
     t::Float64
     dt::Float64
+    secondorder::Int
     celsius::Float64
     v_init::Float64
     start_time::Float64
@@ -299,6 +293,7 @@ NumericalContext(context::DeviceContext) = NumericalContext(
     context.serial,
     context.t,
     context.dt,
+    context.secondorder,
     context.celsius,
     context.v_init,
     context.start_time,
@@ -327,6 +322,7 @@ NumericalContext(context::DeviceContext) = NumericalContext(
         context.serial,
         t,
         dt,
+        context.secondorder,
         context.celsius,
         context.v_init,
         start_time,
@@ -372,6 +368,7 @@ const KernelContext = Union{DeviceContext, NumericalContext}
         context.serial,
         t,
         dt,
+        context.secondorder,
         context.celsius,
         context.v_init,
         start_time,
@@ -657,9 +654,6 @@ function inject_spike!(state::SimulationState, input::SpikeSource, time::Real)
     arrival = Float64(time)
     isfinite(arrival) && arrival >= micro_time(state) ||
         throw(ArgumentError("spike time precedes the current time"))
-    push_event!(
-        state.work[:event_schedule].external,
-        ScheduledEvent(arrival, 0.0, 0, 0, -Int32(source)),
-    )
+    enqueue_event!(state.work[:event_schedule], ScheduledEvent(arrival, 0.0, 0, 0, -Int32(source)))
     return state
 end

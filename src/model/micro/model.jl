@@ -28,7 +28,7 @@ struct PointInstance
     cell::Int
     section::Symbol
     x::Float64
-    parameters::Dict{Symbol, Any}
+    parameters::Vector{Pair{Symbol, Any}}
     spike_times::Union{Tuple{}, Vector{Float64}}
 end
 
@@ -580,7 +580,7 @@ function pack_micro(model::MicroModel, inputs::Vector{MicroInputBinding}; dhs_th
         end
     end
     # 4. Evaluate point parameters in logical order, directly into final columns.
-    # Each point's parameter dictionary is consumed once. Cache only the field
+    # Each point's parameter sequence is consumed once. Cache only the field
     # offsets/permissions shared by a mechanism, not a binding for every point.
     point_fields = [Dict{Symbol, Tuple{Int, Int}}() for _ in groups]
     pattern_times, pattern_targets = Float64[], Int32[]
@@ -817,16 +817,16 @@ function pack_micro(model::MicroModel, inputs::Vector{MicroInputBinding}; dhs_th
     concentration_owners = Set{Tuple{Int32, Symbol}}()
     for group in plans
         ir = group.mechanism.ir
-        for ion in ir.ions
+        for (slot, ion) in enumerate(ir.ions)
             concentrations = (Symbol(ion.name, :i), Symbol(ion.name, :o))
             read_concentration = any(name -> name in ion.reads, concentrations)
             written = filter(name -> name in ion.writes, concentrations)
             concentration_style = !isempty(written) ? 3 : read_concentration ? 1 : 0
             reversal = Symbol(:e, ion.name)
             reversal_style = reversal in ion.writes ? 3 : reversal in ion.reads ? 1 : 0
-            for node in group.nodes
+            for (instance, node) in enumerate(group.nodes)
                 node == 0 && continue
-                row = ion_locations[(node, ion.name)]
+                row = group.ion_rows[instance, slot]
                 ion_styles[row] =
                     promote_ion_style(ion_styles[row], concentration_style, reversal_style)
                 for name in written

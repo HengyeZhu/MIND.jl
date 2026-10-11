@@ -99,7 +99,6 @@ function advance_micro!(state::SimulationState; record_sample::Bool = true)
     micro_currents!(state, time + 0.5 * dt)
     # 2. Assemble and solve the cable system with warp DHS.
     secondorder = state.configuration.secondorder
-    secondorder != 0 && copyto!(state.work[:cable_workspace].previous_voltage, state.voltage)
     launch_kernel!(
         assemble_cable_kernel!,
         length(state.voltage),
@@ -107,8 +106,8 @@ function advance_micro!(state::SimulationState; record_sample::Bool = true)
         state.rhs,
         state.voltage,
         state.capacitance,
-        state.current,
-        state.conductance,
+        state.parent,
+        state.axial,
         state.work[:axial_diagonal],
         secondorder == 0 ? dt : 0.5 * dt,
     )
@@ -117,7 +116,6 @@ function advance_micro!(state::SimulationState; record_sample::Bool = true)
         warps = length(cable.warp_offsets) - 1
         if warps > 0
             CUDA.@cuda always_inline=true threads=128 blocks=cld(warps, 4) solve_dhs_kernel!(
-                state.voltage,
                 state.diagonal,
                 state.rhs,
                 state.parent,
@@ -128,14 +126,14 @@ function advance_micro!(state::SimulationState; record_sample::Bool = true)
                 state.errors,
             )
         end
-        secondorder != 0 && launch_kernel!(
-            second_order_voltage_kernel!,
+        launch_kernel!(
+            update_voltage_kernel!,
             length(state.voltage),
             state.voltage,
-            state.work[:cable_workspace].previous_voltage,
+            state.rhs,
             state.ions,
             state.work[:ion_offsets],
-            Val(secondorder == 2),
+            Val(secondorder),
         )
     end
     # 3. Advance channel states and scheduled post-voltage procedures.
@@ -144,6 +142,10 @@ function advance_micro!(state::SimulationState; record_sample::Bool = true)
     # any macro-boundary writes, at the beginning of the next micro step.
     state.step_micro += 1
     record_sample && record_micro!(state)
+    # NEURON records first, then delivers the second half-step through the
+    # completed boundary. Such receives must precede the next threshold check.
+    state.work[:advance_feedback] && flush_spikes!(state)
+    deliver_events!(state, micro_time(state))
     state.layout.macro_model === nothing && clear_event_counts!(state.macro_spikes.counts)
     return nothing
 end
@@ -164,6 +166,7 @@ function advance_macro!(state::SimulationState)
         for (index, group) in enumerate(state.input_groups)
             trigger_micro_input!(group, state, index, start_time, stop_time)
         end
+        isempty(state.input_groups) || flush_spikes!(state)
         # 3. Solve each micro step. Defer the shared boundary sample until the
         # ROI equations and writes through aliases have also completed.
         count = round(Int, dt / state.configuration.dt_micro)
@@ -212,8 +215,8 @@ function micro_currents!(state::SimulationState, time::Float64)
             state.work[:ion_species],
             state.work[:ion_styles],
             state.configuration.celsius,
-            state.current,
-            state.conductance,
+            state.rhs,
+            state.diagonal,
         )
         execute_phase!(state, state.work[:current_schedule], Val(:current), time)
     end
@@ -392,8 +395,7 @@ function advance_micro_output!(group::DeviceMechanism, state, index, start_time,
         stop_time,
     )
     kernel = CUDA.kernel_compile(call; always_inline = true)
-    threads = min(128, kernel_configuration(kernel.fun).threads)
     blocks = group.context.serial isa Val{true} ? 1 : count
-    CUDA.kernel_launch(kernel, call; threads, blocks)
+    CUDA.kernel_launch(kernel, call; threads = 128, blocks)
     return nothing
 end

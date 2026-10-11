@@ -74,8 +74,6 @@ function allocate_simulation(plan::ModelLayout; bindings = ())
         copy_index(:parent),
         CuArray{Float64}(undef, node_count),
         CuArray{Float64}(undef, node_count),
-        CuArray{Float64}(undef, node_count),
-        CuArray{Float64}(undef, node_count),
         micro_plan === nothing ? CUDA.zeros(Float64, 0, 0) : CuArray(micro_plan.ion_data),
         outbox,
         spikes,
@@ -142,8 +140,6 @@ function allocate_simulation(plan::ModelLayout; bindings = ())
     delete!(state.work, :alias_descriptors)
     # 4. Prepare micro groups, ion metadata, cable workspaces and density batches.
     if micro_plan !== nothing
-        state.work[:cable_workspace] =
-            CableWorkspace(plan.secondorder == 0 ? CUDA.zeros(Float64, 0) : copy(voltage))
         append!(
             state.groups,
             [allocate_group(group, state, plan.dt_micro) for group in micro_plan.groups],
@@ -170,6 +166,10 @@ function allocate_simulation(plan::ModelLayout; bindings = ())
                 ),
             alg = MergeSort,
         )
+        state.work[:advance_feedback] = any(state.groups) do group
+            block = get(group.mechanism.ir.blocks, :breakpoint, nothing)
+            block !== nothing && (block.effects.schedules_events || block.effects.emits_spikes)
+        end
         # Fuse launch-limited populations; larger groups get separate kernels
         # to retain occupancy and avoid scanning sparse mechanism/node maps.
         # Alias-bearing groups stay separate; the access DAG orders their
@@ -178,8 +178,8 @@ function allocate_simulation(plan::ModelLayout; bindings = ())
         fuse_density =
             node_count <= 512 * multiprocessors &&
             count(group -> group.mechanism.ir.kind == :density, state.groups) > 1
-        for (phase, groups) in
-            ((:current, state.groups), (:advance, state.work[:ordered_micro_groups]))
+        for phase in (:current, :advance)
+            groups = state.work[:ordered_micro_groups]
             batches, separate, jobs =
                 micro_phase_operations(groups, node_count, phase, fuse_density)
             state.work[Symbol(:density_, phase)] = batches
@@ -278,7 +278,7 @@ function initialize!(state::SimulationState; restore::Bool = true)
     fill!(state.errors, 0)
     clear_event_counts!(state.outbox.count)
     clear_event_counts!(state.outbox.sequences)
-    reset_events!(state.work[:event_schedule])
+    reset_events!(state)
     fill!(state.source_above, false)
     clear_event_counts!(state.spikes.counts)
     clear_event_counts!(state.macro_spikes.counts)
@@ -334,8 +334,8 @@ function initialize!(state::SimulationState; restore::Bool = true)
             state.work[:ion_species],
             state.work[:ion_styles],
             state.configuration.celsius,
-            state.current,
-            state.conductance,
+            state.rhs,
+            state.diagonal,
             Val(true),
         )
     end
@@ -343,6 +343,11 @@ function initialize!(state::SimulationState; restore::Bool = true)
         for (index, group) in enumerate(groups)
             weights = groups === state.edge_groups ? state.work[:edge_weights][index] : nothing
             initialize_group!(group, state; weights)
+            initial = get(group.mechanism.ir.blocks, :initial, nothing)
+            if initial !== nothing &&
+               (initial.effects.schedules_events || initial.effects.emits_spikes)
+                flush_spikes!(state)
+            end
             if state.layout.micro !== nothing && any(
                 ion -> Symbol(ion.name, :i) in ion.writes || Symbol(ion.name, :o) in ion.writes,
                 group.mechanism.ir.ions,
@@ -370,6 +375,7 @@ function initialize!(state::SimulationState; restore::Bool = true)
     initialization = state.work[:connection_initialization]
     if initialization !== nothing
         launch_kernel!(initialize_connections_kernel!, initialization.count, initialization.payload)
+        flush_spikes!(state; ordered = true)
     end
     # 4. Deliver time-zero events and establish the initial membrane currents.
     if state.layout.micro !== nothing
@@ -477,6 +483,7 @@ function allocate_group(plan::MechanismPlan, state::SimulationState, dt::Float64
         Val(serial_group_instances(state, plan)),
         0.0,
         dt,
+        state.configuration.secondorder,
         temperature,
         -65.0,
         0.0,
@@ -610,77 +617,56 @@ function prepare_event_schedule!(state::SimulationState, target_offsets, target_
         end
     end
 
-    # 2. Independent target levels batch safely; cycles/shared aliases retain
-    # one globally chronological queue and stop at each feedback-producing event.
-    children = [Int32[] for _ in 1:count]
-    indegree = zeros(Int, count)
-    if state.layout.micro !== nothing
-        plan = state.layout.micro
-        for (source, target) in enumerate(plan.source_targets)
-            target == 0 && continue
-            append!(
-                children[target],
-                view(
-                    plan.edge_targets,
-                    plan.fanout_offsets[source]:(plan.fanout_offsets[source + 1] - 1),
-                ),
-            )
-        end
-        for outgoing in children
-            sort!(outgoing)
-            unique!(outgoing)
-            for target in outgoing
-                indegree[target] += 1
-            end
-        end
-    end
-    frontier = findall(iszero, indegree)
-    target_levels = zeros(Int, count)
-    processed, level = 0, 0
-    while !isempty(frontier)
-        level += 1
-        next = Int[]
-        for target in frontier
-            processed += 1
-            target_groups[target] != 0 && (target_levels[target] = level)
-            for child in children[target]
-                indegree[child] -= 1
-                indegree[child] == 0 && push!(next, child)
-            end
-        end
-        frontier = next
-    end
-    ordered =
-        processed < count || any(groups) do group
-            (serial_instances(group.mechanism.ir) || any(last, group.context.ion_events)) &&
+    # 2. Preserve one chronological queue. Only independent receivers may be
+    # grouped for device execution; a feedback event ends the current batch.
+    ordered = any(groups) do group
+        (serial_instances(group.mechanism.ir) || any(last, group.context.ion_events)) &&
             haskey(group.mechanism.ir.blocks, :net_receive)
-        end
-    if ordered
-        target_levels .= Int.(target_groups .!= 0)
-        level = 1
     end
+    # Parallel producers publish in arbitrary CUDA order. Restore their logical
+    # instance order before assigning CPU insertion tickets, keeping each
+    # producer's net_send/net_event calls in their original sequence.
+    target_ranks = zeros(Int, count)
+    rank = 0
+    for group in groups
+        any(
+            block -> block.effects.schedules_events || block.effects.emits_spikes,
+            values(group.mechanism.ir.blocks),
+        ) || continue
+        # Logical identities already carry creation order. Receivers without
+        # event output need no producer ranks, and no group needs another sort.
+        for (row, target) in enumerate(group.plan.targets)
+            target == 0 && continue
+            target_ranks[target] = rank + Int(group.plan.logical_ids[row]) + 1
+        end
+        rank += Int(maximum(group.plan.logical_ids; init = 0)) + 1
+    end
+    source_ranks =
+        state.layout.micro === nothing ? Int[] :
+        Int[
+            target == 0 ? rank + source : target_ranks[target] for
+            (source, target) in enumerate(state.layout.micro.source_targets)
+        ]
 
     # 3. Retain one compact outbox and reusable host/device delivery buffers.
     capacity = length(state.outbox.values)
     transferred = CUDA.CuEvent(CUDA.EVENT_DISABLE_TIMING)
     CUDA.record(transferred)
     state.work[:event_schedule] = EventSchedule(
-        [ScheduledEvent[] for _ in 1:level],
         ScheduledEvent[],
         target_groups,
         target_rows,
-        target_levels,
+        target_ranks,
+        source_ranks,
         target_offsets,
         target_sources,
         feedback,
         ordered,
-        1,
+        0,
         CUDA.pin(zeros(Int64, 1)),
         CUDA.pin(Vector{ScheduledEvent}(undef, capacity)),
         CuArray{ScheduledEvent}(undef, capacity),
         ScheduledEvent[],
-        ScheduledEvent[],
-        falses(count),
         CuArray{ScheduledEvent}(undef, capacity),
         CUDA.pin(Vector{ScheduledEvent}(undef, capacity)),
         Int64[],
@@ -718,7 +704,11 @@ function prepare_event_schedule!(state::SimulationState, target_offsets, target_
         offsets = Int64[1]
         ordered = any(initialized_groups) do index
             ir = groups[index].mechanism.ir
-            has_shared_writes(ir) || has_pointers(ir)
+            effects = ir.blocks[:net_receive].effects
+            has_shared_writes(ir) ||
+                has_pointers(ir) ||
+                effects.schedules_events ||
+                effects.emits_spikes
         end
         if !ordered
             sort!(edges; by = edge -> plan.edge_targets[edge], alg = MergeSort)
@@ -938,8 +928,8 @@ function mechanism_access!(access, state, group, phase, rows; exclusive = false)
         )
             add_access!(access.reads, (kind, index, Int(field)), row_set)
         end
-        add_access!(sums, (:current, 0, 0), nodes)
-        add_access!(sums, (:conductance, 0, 0), nodes)
+        add_access!(sums, (:rhs, 0, 0), nodes)
+        add_access!(sums, (:diagonal, 0, 0), nodes)
         for binding in axes(group.plan.ion_writes, 2)
             column = Int(group.plan.ion_writes[2, binding])
             slot = group.plan.ion_writes[3, binding]
@@ -1113,8 +1103,8 @@ function phase_storage(state)
         (
             state.voltage,
             state.ions,
-            state.current,
-            state.conductance,
+            state.rhs,
+            state.diagonal,
             state.exposures,
             state.input_exposures,
             state.exposure_snapshot,

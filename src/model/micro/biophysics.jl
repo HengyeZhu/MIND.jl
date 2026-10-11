@@ -139,7 +139,7 @@ Defaults in a MOD declaration do not override the ion species defaults.
 """
 function collect_ion_parameters!(assignments, row, ir::MechanismIR, parameters, node::Int32)
     isempty(ir.ions) && return nothing
-    for name in keys(parameters)
+    for (name, _) in parameters
         for ion in ir.ions
             name in ion.reads || name in ion.writes || continue
             node > 0 || throw(ArgumentError("ion parameter $name requires a cable location"))

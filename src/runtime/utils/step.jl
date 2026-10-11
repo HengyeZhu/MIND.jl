@@ -2,16 +2,6 @@
 
 # Shared launch policy and concrete-type boundaries for generated kernels.
 # Keep forwarded kernel argument tuples specialized, including their arity.
-const KERNEL_LAUNCH_CONFIGURATIONS =
-    IdDict{CUDA.CuFunction, NamedTuple{(:blocks, :threads), Tuple{Int, Int}}}()
-const KERNEL_LAUNCH_LOCK = ReentrantLock()
-
-function kernel_configuration(function_::CUDA.CuFunction)
-    return Base.@lock KERNEL_LAUNCH_LOCK get!(KERNEL_LAUNCH_CONFIGURATIONS, function_) do
-        CUDA.launch_configuration(function_)
-    end
-end
-
 function launch_kernel!(
     function_::F,
     count::Integer,
@@ -19,8 +9,6 @@ function launch_kernel!(
     stream::CUDA.CuStream = CUDA.stream(),
 ) where {F, N}
     count == 0 && return nothing
-    # Convert and compile once. Occupancy reflects this generated kernel's
-    # register/shared-memory use on the active device, not a fixed population cut.
     call = CUDA.KernelCall(function_, arguments...)
     kernel = CUDA.kernel_compile(call; always_inline = true)
     launch_compiled_kernel!(kernel, call, count, stream)
@@ -28,8 +16,9 @@ function launch_kernel!(
 end
 
 function launch_compiled_kernel!(kernel, call, count, stream)
-    configuration = kernel_configuration(kernel.fun)
-    threads = min(count, configuration.threads, max(32, 32 * cld(count, 32 * configuration.blocks)))
+    # Four warps per block leave room for concurrent mechanism kernels.
+    # Scalar ordered phases still launch exactly their requested worker count.
+    threads = min(count, 128)
     CUDA.kernel_launch(kernel, call; threads, blocks = cld(count, threads), stream)
     return nothing
 end
@@ -69,8 +58,8 @@ function mechanism_currents!(
         group.mechanism.current!,
         group.data,
         context_at(group.phases.context; t = time),
-        state.current,
-        state.conductance,
+        state.rhs,
+        state.diagonal,
         group.phases.current_fields,
         group.phases.electrode_fields,
         group.ion_reads,
@@ -112,8 +101,8 @@ function launch_phase_job!(state, job::PhaseJob, ::Val{:current}, time, stream)
             density.operations,
             density.rows,
             density.nodes,
-            state.current,
-            state.conductance,
+            state.rhs,
+            state.diagonal,
             state.ions,
             time;
             stream,
@@ -159,8 +148,9 @@ function detect_spikes!(state, time)
         state.source_above,
         state.spikes,
         state.macro_spikes,
+        state.outbox,
         state.errors,
-        time,
+        time + 1.0e-10,
     )
     return nothing
 end

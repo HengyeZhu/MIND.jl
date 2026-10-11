@@ -109,11 +109,10 @@ end
     target = context.targets[row]
     sequence = context.outbox.sequences[target] + 1
     context.outbox.sequences[target] = sequence
-    order = Int64(size(context.weights, 1)) + sequence
     emit_event!(
         context.outbox,
         context.errors,
-        ScheduledEvent(context.t + delay, flag, context.edge, order, Int32(target)),
+        ScheduledEvent(context.t + delay, flag, context.edge, sequence, Int32(target)),
     )
     return 0.0
 end
@@ -150,10 +149,19 @@ end
 @inline function emit_spike!(context, row, time::Float64)
     target = context.targets[row]
     target == 0 && return 0.0
+    sequence = context.outbox.sequences[target] + 1
+    context.outbox.sequences[target] = sequence
     for offset in context.target_offsets[target]:(context.target_offsets[target + 1] - 1)
         source = context.target_sources[offset]
         append_spike!(context.spikes, context.errors, source, time)
         append_spike!(context.macro_spikes, context.errors, source, time)
+        # Publish at the MOD call site, preserving its order relative to
+        # net_send. A later sweep of the spike buffer would lose that order.
+        emit_event!(
+            context.outbox,
+            context.errors,
+            ScheduledEvent(time, 0.0, context.edge, sequence, -Int32(source)),
+        )
     end
     return 0.0
 end
@@ -245,21 +253,6 @@ function receive_ordered_kernel!(payload, events, count)
     return nothing
 end
 
-"""Transfer only emitted spikes; CPU fanout avoids expanding one device request per edge."""
-function collect_spikes_kernel!(spikes, outbox, errors)
-    source = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
-    source > length(spikes.counts) && return nothing
-    @inbounds for slot in 1:spikes.counts[source]
-        emit_event!(
-            outbox,
-            errors,
-            ScheduledEvent(spike_time(spikes, source, slot), 0.0, 0, 0, -Int32(source)),
-        )
-    end
-    @inbounds spikes.counts[source] = 0
-    return nothing
-end
-
 function publish_external_spikes_kernel!(events, count, spikes, macro_spikes, errors)
     index = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
     index > count && return nothing
@@ -289,7 +282,7 @@ function gather_event_requests_kernel!(values, outbox, count)
     return nothing
 end
 
-function detect_spikes_kernel!(detectors, above, spikes, macro_spikes, errors, time)
+function detect_spikes_kernel!(detectors, above, spikes, macro_spikes, outbox, errors, time)
     detector = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
     detector > length(above) && return nothing
     @inbounds begin
@@ -300,6 +293,7 @@ function detect_spikes_kernel!(detectors, above, spikes, macro_spikes, errors, t
                 source = detectors.sources[index]
                 append_spike!(spikes, errors, source, time)
                 append_spike!(macro_spikes, errors, source, time)
+                emit_event!(outbox, errors, ScheduledEvent(time, 0.0, 0, 0, -Int32(source)))
             end
         end
         above[detector] = current
@@ -308,6 +302,25 @@ function detect_spikes_kernel!(detectors, above, spikes, macro_spikes, errors, t
 end
 
 # Generated mechanism and ion kernels.
+
+"""Accumulate FP64 sums with CUDA atomicAdd's device-scope relaxed ordering.
+
+Numerical consumers wait at warp barriers or stream joins. These sums do not
+publish unrelated data; event and allocation atomics retain their own ordering.
+"""
+@inline function atomic_sum!(address::Core.LLVMPtr{Float64, CUDA.AS.Global}, value::Float64)
+    Base.llvmcall(
+        """
+        %previous = atomicrmw fadd ptr addrspace(1) %0, double %1 syncscope("device") monotonic
+        ret void
+        """,
+        Cvoid,
+        Tuple{Core.LLVMPtr{Float64, CUDA.AS.Global}, Float64},
+        address,
+        value,
+    )
+    return nothing
+end
 
 @inline function receive_ions!(data, row, context, ::Val{Publish}) where {Publish}
     node = context.nodes[row]
@@ -382,8 +395,8 @@ function mechanism_current_kernel!(
     function_::F,
     data,
     context,
-    current,
-    conductance,
+    rhs,
+    diagonal,
     current_fields,
     electrode_fields,
     ion_reads,
@@ -397,8 +410,8 @@ function mechanism_current_kernel!(
             row,
             data,
             context,
-            current,
-            conductance,
+            rhs,
+            diagonal,
             current_fields,
             electrode_fields,
             ion_reads,
@@ -416,8 +429,8 @@ end
     row,
     data,
     context,
-    current,
-    conductance,
+    rhs,
+    diagonal,
     ::Val{CurrentFields},
     ::Val{ElectrodeFields},
     ::Val{Reads},
@@ -452,11 +465,11 @@ end
     end
     scale = Density ? (@inbounds context.area[node]) * 0.01 : 1.0
     if Exclusive
-        @inbounds current[node] += scale * value
-        @inbounds conductance[node] += scale * (shifted - value) / 0.001
+        @inbounds rhs[node] -= scale * value
+        @inbounds diagonal[node] += scale * (shifted - value) / 0.001
     else
-        CUDA.atomic_add!(pointer(current, node), scale * value)
-        CUDA.atomic_add!(pointer(conductance, node), scale * (shifted - value) / 0.001)
+        atomic_sum!(pointer(rhs, node), -scale * value)
+        atomic_sum!(pointer(diagonal, node), scale * (shifted - value) / 0.001)
     end
     @inbounds for (field, column, slot) in Writes
         ion_row = context.ion_rows[row, slot]
@@ -467,7 +480,7 @@ end
             if Exclusive
                 ions[linear] += value
             else
-                CUDA.atomic_add!(pointer(ions, linear), value)
+                atomic_sum!(pointer(ions, linear), value)
             end
             for component in eachindex(CurrentFields)
                 CurrentFields[component] == field || continue
@@ -476,7 +489,7 @@ end
                 if Exclusive
                     ions[offset] += derivative
                 else
-                    CUDA.atomic_add!(pointer(ions, offset), derivative)
+                    atomic_sum!(pointer(ions, offset), derivative)
                 end
             end
         else
@@ -490,8 +503,8 @@ end
     operations::T,
     rows,
     nodes,
-    current,
-    conductance,
+    rhs,
+    diagonal,
     ions,
     time,
 ) where {T <: Tuple}
@@ -508,8 +521,8 @@ end
                     row,
                     operation.data,
                     context_at(operation.context; t = time),
-                    current,
-                    conductance,
+                    rhs,
+                    diagonal,
                     operation.current_fields,
                     operation.electrode_fields,
                     operation.ion_reads,
@@ -591,16 +604,16 @@ function prepare_currents_kernel!(
     species_ids,
     styles,
     celsius,
-    current,
-    conductance,
+    rhs,
+    diagonal,
     ::Val{Initial} = Val(false),
 ) where {Initial}
     row = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
     mask = Initial ? 0x20 : 0x40
     @inbounds begin
-        if row <= length(current)
-            current[row] = 0.0
-            conductance[row] = 0.0
+        if row <= length(rhs)
+            rhs[row] = 0.0
+            diagonal[row] = 0.0
         end
         if row <= size(ions, 1)
             ions[row, 4] = 0.0
@@ -622,37 +635,45 @@ function assemble_cable_kernel!(
     rhs,
     voltage,
     capacitance,
-    current,
-    conductance,
+    parent,
+    axial,
     axial_diagonal,
     dt,
 )
     node = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
     node > length(voltage) && return nothing
-    capacitance_rate = capacitance[node] / dt
-    diagonal[node] = capacitance_rate + conductance[node] + axial_diagonal[node]
-    rhs[node] = (capacitance_rate + conductance[node]) * voltage[node] - current[node]
+    @inbounds begin
+        # Mechanisms already accumulated -I and dI/dV into the system.
+        # Each diagonal has one writer; shared axial RHS additions stay atomic.
+        diagonal[node] = capacitance[node] / dt + diagonal[node] + axial_diagonal[node]
+        ancestor = parent[node]
+        if ancestor != 0
+            current = axial[node] * (voltage[ancestor] - voltage[node])
+            atomic_sum!(pointer(rhs, node), current)
+            atomic_sum!(pointer(rhs, ancestor), -current)
+        end
+    end
     return nothing
 end
 
-"""Extrapolate the half-step cable solution and apply NEURON's ion-current correction."""
-function second_order_voltage_kernel!(
+"""Apply the solved voltage increment and NEURON's optional ion-current correction."""
+function update_voltage_kernel!(
     voltage,
-    previous,
+    increments,
     ions,
     offsets,
-    ::Val{CorrectIons},
-) where {CorrectIons}
+    ::Val{SecondOrder},
+) where {SecondOrder}
     node = (blockIdx().x - Int32(1)) * blockDim().x + threadIdx().x
     node > length(voltage) && return nothing
     @inbounds begin
-        delta = voltage[node] - previous[node]
-        if CorrectIons
+        delta = increments[node]
+        if SecondOrder == 2
             for row in offsets[node]:(offsets[node + 1] - 1)
                 ions[row, 4] += ions[row, 5] * delta
             end
         end
-        voltage[node] = previous[node] + 2.0 * delta
+        voltage[node] += SecondOrder == 0 ? delta : 2.0 * delta
     end
     return nothing
 end
@@ -665,7 +686,6 @@ rounds explicitly unrolled. Warp barriers preserve dependencies on NVIDIA GPUs
 with independent thread scheduling, including lanes that finish early.
 """
 function solve_dhs_kernel!(
-    voltage,
     diagonal,
     rhs,
     parent,
@@ -699,8 +719,8 @@ function solve_dhs_kernel!(
                         end
                         if ancestor != 0
                             factor = coupling / pivot
-                            CUDA.atomic_add!(pointer(diagonal, ancestor), -factor * coupling)
-                            CUDA.atomic_add!(pointer(rhs, ancestor), factor * value)
+                            atomic_sum!(pointer(diagonal, ancestor), -factor * coupling)
+                            atomic_sum!(pointer(rhs, ancestor), factor * value)
                         end
                     end
                     CUDA.sync_warp()
@@ -716,8 +736,8 @@ function solve_dhs_kernel!(
                         node = round_offsets[round] + lane
                         ancestor = parent[node]
                         coupling, pivot, value = axial[node], diagonal[node], rhs[node]
-                        ancestor != 0 && (value += coupling * voltage[ancestor])
-                        voltage[node] = value / pivot
+                        ancestor != 0 && (value += coupling * rhs[ancestor])
+                        rhs[node] = value / pivot
                     end
                     CUDA.sync_warp()
                     round -= Int32(1)

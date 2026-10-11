@@ -89,10 +89,14 @@ function create_pointprocess!(
     times = isempty(spike_times) ? () : collect(Float64, spike_times)
     all(isfinite, times) && all(>=(0.0), times) || throw(ArgumentError("invalid spike times"))
     issorted(times) || throw(ArgumentError("spike times must be sorted"))
-    push!(
-        model.points,
-        PointInstance(compiled, cell, section, x, parameter_values(parameters), times),
-    )
+    # Point parameters are consumed once during packing, in the supplied order.
+    # Retain an independent snapshot without a hash table for every synapse.
+    values = Pair{Symbol, Any}[
+        Symbol(name) =>
+            (value isa Real ? Float64(value) : value isa AbstractArray ? copy(value) : value)
+        for (name, value) in pairs(parameters)
+    ]
+    push!(model.points, PointInstance(compiled, cell, section, x, values, times))
     return PointProcess(model, length(model.points))
 end
 
@@ -326,13 +330,13 @@ function apply_point_parameters!(
     count::Int,
     physical_row::Int,
     ir::MechanismIR,
-    parameters::Dict{Symbol, Any},
+    parameters::Vector{Pair{Symbol, Any}},
     fields::Dict{Symbol, Tuple{Int, Int}},
     ion_parameters::Dict{Tuple{Int32, Symbol}, Float64},
     node::Int32,
 )
-    # A point's assignments are used once; no tuple, binding vectors or
-    # per-instance cache entry is needed. Resolve shared metadata lazily from IR.
+    # Resolve each supplied name through shared metadata without creating a
+    # separate binding program or cache entry for every instance.
     row = view(values, physical_row:count:length(values))
     for (name, value) in parameters
         offset, extent = get!(fields, name) do

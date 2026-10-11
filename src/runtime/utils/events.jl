@@ -40,8 +40,12 @@ function pop_event!(heap::Vector{ScheduledEvent})
 end
 
 function enqueue_event!(schedule::EventSchedule, event::ScheduledEvent)
-    level = schedule.target_levels[event.target]
-    level != 0 && push_event!(schedule.heaps[level], event)
+    event.target > 0 && schedule.target_groups[event.target] == 0 && return nothing
+    schedule.next_order += 1
+    push_event!(
+        schedule.heap,
+        ScheduledEvent(event.time, event.flag, event.edge, schedule.next_order, event.target),
+    )
     return nothing
 end
 
@@ -85,13 +89,23 @@ function upload_events!(schedule::EventSchedule, count::Int)
     return nothing
 end
 
-function reset_events!(schedule::EventSchedule)
-    foreach(empty!, schedule.heaps)
-    empty!(schedule.external)
+function reset_events!(state::SimulationState)
+    schedule = state.work[:event_schedule]
+    empty!(schedule.heap)
     empty!(schedule.pending)
-    empty!(schedule.postponed)
-    fill!(schedule.marked, false)
-    schedule.pattern_cursor = 1
+    schedule.next_order = 0
+    plan = state.layout.micro
+    if plan !== nothing
+        for (index, time) in enumerate(plan.pattern_times)
+            target = plan.pattern_targets[index]
+            for offset in
+                schedule.target_source_offsets[target]:(schedule.target_source_offsets[target + 1] - 1)
+
+                source = schedule.target_sources[offset]
+                enqueue_event!(schedule, ScheduledEvent(time, 0.0, 0, 0, -source))
+            end
+        end
+    end
     return nothing
 end
 

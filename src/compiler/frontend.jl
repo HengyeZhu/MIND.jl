@@ -1583,14 +1583,16 @@ function analyze_mod(ast::ModAST)
             field.name in writes &&
             throw(ModError(field.location, "CONSTANT $(field.name) cannot be assigned"))
         if field.scope == :global && ast.threadsafe && field.name in writes
-            # NMODL's writable thread scratch starts at zero, even when the
-            # original PARAMETER declaration has a nonzero global default.
+            # NEURON's writable THREADSAFE globals start at zero and remain
+            # shared within its simulation thread. GPU workers are mechanism
+            # instances, not independent NEURON threads: preserve this storage
+            # identity and the ordered execution required by shared writes.
             fields[index] = IRField(
                 field.name,
                 field.offset,
                 field.extent,
                 field.category,
-                :thread,
+                :global,
                 field.units,
                 0.0,
                 field.bounds,

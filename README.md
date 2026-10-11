@@ -14,5 +14,5 @@ MIND.jl is the Julia version of [MIND_Sim](https://github.com/HengyeZhu/MIND_Sim
 
 | GPU example | MIND_Sim pre-run (s) | MIND.jl pre-run (s) | MIND_Sim run (s) | MIND.jl run (s) |
 | --- | ---: | ---: | ---: | ---: |
-| HL23 micro | 3.667 | 3.624 | 11.603 | 11.172 |
-| CA3 micro–macro | 0.141 | 0.136 | 15.467 | 8.274 |
+| HL23 micro | 3.695 | 3.547 | 11.695 | 10.352 |
+| CA3 micro–macro | 0.145 | 0.117 | 15.433 | 8.952 |
